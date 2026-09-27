@@ -1,0 +1,104 @@
+name: Generate TrollFools files
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "YouMod branch or tag to build"
+        required: true
+        default: "main"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trollfools-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build YouMod for TrollFools
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout YouMod
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install build dependencies
+        run: brew install make ldid dpkg
+
+      - name: Configure Theos
+        run: |
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+          echo "THEOS=$GITHUB_WORKSPACE/theos" >> "$GITHUB_ENV"
+
+      - name: Resolve Theos revision
+        run: |
+          commit=$(git ls-remote https://github.com/roothide/theos HEAD | awk '{print substr($1,1,7)}')
+          echo "THEOS_COMMIT=$commit" >> "$GITHUB_ENV"
+
+      - name: Cache Theos
+        id: cache-theos
+        uses: actions/cache@v6
+        with:
+          path: theos
+          key: YouMod-TrollFools-iOS-26.5-${{ env.THEOS_COMMIT }}
+
+      - name: Install Theos and iOS SDK
+        if: steps.cache-theos.outputs.cache-hit != 'true'
+        run: |
+          git clone --quiet --depth=1 --recurse-submodules https://github.com/roothide/theos.git theos
+          git clone --quiet --depth=1 -n --filter=tree:0 https://github.com/Tonwalter888/iOS-SDKs.git iOS-SDKs
+          git -C iOS-SDKs sparse-checkout set --no-cone iPhoneOS26.5.sdk
+          git -C iOS-SDKs checkout --quiet
+          mkdir -p "$THEOS/sdks"
+          mv iOS-SDKs/*.sdk "$THEOS/sdks/"
+
+      - name: Install YouTube headers
+        run: |
+          mkdir -p "$THEOS/include"
+          if [ ! -d "$THEOS/include/YouTubeHeader" ]; then
+            git clone --quiet --depth=1 https://github.com/PoomSmart/YouTubeHeader.git "$THEOS/include/YouTubeHeader"
+          fi
+          if [ ! -d "$THEOS/include/PSHeader" ]; then
+            git clone --quiet --depth=1 https://github.com/PoomSmart/PSHeader.git "$THEOS/include/PSHeader"
+          fi
+
+      - name: Build non-RootHide package
+        run: |
+          make clean package DEBUG=0 FINALPACKAGE=1 ARCHS=arm64
+          package=$(find packages -maxdepth 1 -type f -name '*.deb' -print -quit)
+          test -n "$package"
+          echo "PACKAGE=$package" >> "$GITHUB_ENV"
+
+      - name: Extract and validate TrollFools files
+        run: |
+          mkdir -p extracted trollfools
+          dpkg-deb -x "$PACKAGE" extracted
+          find extracted -type f -name '*.dylib' -exec cp {} trollfools/ \;
+          find extracted -type d -name '*.bundle' -exec cp -R {} trollfools/ \;
+
+          test -n "$(find trollfools -maxdepth 1 -type f -name '*.dylib' -print -quit)"
+          test -n "$(find trollfools -maxdepth 1 -type d -name '*.bundle' -print -quit)"
+
+          dylib=$(find trollfools -maxdepth 1 -type f -name '*.dylib' -print -quit)
+          otool -L "$dylib" | tee dependencies.txt
+          if grep -Eq '\.jbroot|/var/jb|libroothide' dependencies.txt; then
+            echo 'Jailbreak-bootstrap dependency detected in the built dylib.' >&2
+            exit 1
+          fi
+
+          version=$(sed -n 's/^Version: //p' control | head -n 1)
+          (cd trollfools && zip -r "../YouMod_TrollFools_${version}.zip" .)
+          echo "OUTPUT=YouMod_TrollFools_${version}.zip" >> "$GITHUB_ENV"
+
+      - name: Upload TrollFools ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          name: YouMod-TrollFools
+          path: ${{ env.OUTPUT }}
+          if-no-files-found: error
+          retention-days: 14
